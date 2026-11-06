@@ -1,0 +1,803 @@
+# BanItemMega.sk - Combined BanItem + MegaOre
+# Requires Skript 2.7+ and Paper/Spigot 1.20+ (original scripts' requirements).
+# Install: unload/remove the original BanItem.sk and MegaOre.sk first to avoid
+# duplicate commands, functions, events and repeated deliveries. Then put this
+# file in plugins/Skript/scripts/ and run /sk reload BanItemMega.
+# IMPORTANT: a non-immune player holding the blade in their MAIN HAND is banned.
+# Join, respawn, /giveall and the 5-minute refill give ONE blade by default.
+# Full inventories drop the blade at the player's feet, like original MegaOre.
+# XP refill is retained. /orerain now drops cursed blades instead of ores.
+# OPs and players with banitem.immune are immune, as in original BanItem.
+# Test on a non-OP alternate account and keep /banitem unban ready.
+# This combines the original files' logic; test compatibility on your server.
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BanItem.sk  -  the cursed blade that banishes whoever holds it
+#  ---------------------------------------------------------------------------
+#  Target : Spigot / Paper 1.20+   |   Skript 2.7+   |   no addons required
+#  Install: plugins/Skript/scripts/BanItem.sk   ->   /sk reload BanItem
+#
+#  QUICK START
+#    1) /banitem create          gives the sender the cursed blade
+#    2) hold it in your MAIN HAND (test on an alt, not your admin account!)
+#    3) you are banned, the blade is wiped from your inventory, server is told
+#
+#  FULL INSTALLATION + CONFIG GUIDE IS AT THE BOTTOM OF THIS FILE.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  1) CONFIG DEFAULTS
+#     Variables are persistent, so these only run the first time (or when an
+#     admin deletes the variable). Edit the values below, then /sk reload.
+#
+#     {banitem::enabled}              true/false  - master switch for detection
+#     {banitem::config::reason}       kick/ban screen text
+#     {banitem::config::silent}       true -> no server-wide broadcast
+#     {banitem::config::max-log}      how many log lines to keep (default 250)
+# ══════════════════════════════════════════════════════════════════════════════
+on script load:
+    if {banitem::enabled} is not set:
+        set {banitem::enabled} to true
+    if {banitem::config::reason} is not set:
+        set {banitem::config::reason} to "You held the Cursed Blade of Banishment."
+    if {banitem::config::silent} is not set:
+        set {banitem::config::silent} to false
+    if {banitem::config::max-log} is not set:
+        set {banitem::config::max-log} to 250
+    send "&8[&4BanItem&8] &7Loaded. &f/banitem help &7for commands." to console
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  2) ITEM FACTORY
+#     Builds a fresh cursed blade. Change the base material and the texts here.
+#     The glow comes from a real enchantment (unbreaking 1) - it is harmless but
+#     makes the item shiny. Steel yourself: it also shows "Unbreaking I".
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_makeItem() :: item:
+    # --- base material: EDIT ME (must be a valid Skript item alias) ---
+    set {_item} to netherite sword
+
+    set name of {_item} to "&4&l☠ Cursed Blade of Banishment"
+
+    set {_lore::1} to "&8&m────────────────────"
+    set {_lore::2} to "&7A relic of pure malice."
+    set {_lore::3} to "&7Whoever holds it in their"
+    set {_lore::4} to "&cmain hand &7is &4&lBANISHED&7."
+    set {_lore::5} to "&8[BAN ITEM]"
+    set {_lore::6} to "&8&m────────────────────"
+    set lore of {_item} to {_lore::*}
+
+    # glowing enchantment (any enchant works; unbreaking is harmless)
+    enchant {_item} with unbreaking 1
+
+    return {_item}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  3) IDENTITY CHECK
+#     Is this item the curse? We check the display name AND the hidden-ish lore
+#     marker, so a random renamed sword will not trigger the ban.
+#
+#     NOTE ON SPOOFING: identity is name + lore based, so a player who copies
+#     both exactly could forge a cursed blade. That is cosmetic only (they still
+#     get banned when they hold it). If you want tamper-proof identity, install
+#     SkBee and store an NBT tag instead, e.g.:
+#        set {_item}'s nbt compound tag "banitem" to "1"
+#     then in the check below use:
+#        if {_i}'s nbt compound tag "banitem" is not "1":
+#            return false
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_isCurse(i: item) :: boolean:
+    if {_i} is not set:
+        return false
+    if {_i} is air:
+        return false
+
+    set {_name} to name of {_i}
+    if {_name} is not set:
+        return false
+    if {_name} does not contain "Cursed Blade of Banishment":
+        return false
+
+    # "%lore of ...%" flattens the lore lines into one string, so colour codes
+    # in front of the marker do not break the match
+    if "%lore of {_i}%" does not contain "[BAN ITEM]":
+        return false
+
+    return true
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  4) INVENTORY WIPE
+#     Removes every cursed blade from the player's inventory.
+#     Slots 0-40 = hotbar (0-8), main inventory (9-35), armour (36-39), offhand
+#     (40). Only matching items are touched; nothing else is cleared.
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_purge(p: player):
+    if {_p} is not set:
+        stop
+    loop 0 to 40:
+        set {_slot} to slot (loop-value) of {_p}'s inventory
+        if banitem_isCurse({_slot}) is true:
+            set slot (loop-value) of {_p}'s inventory to air
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  5) WHITELIST / IMMUNITY
+#     Immune if any of these is true:
+#       - uuid is on the whitelist   (set automatically when added while online)
+#       - name is on the whitelist   (used for offline additions)
+#       - the player has permission  banitem.immune
+#     Server operators get every permission by default, so ops are immune out of
+#     the box. Give banitem.immune to staff through your permission plugin.
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_isImmune(p: player) :: boolean:
+    set {_uuid} to "%{_p}'s uuid%"
+    if {banitem::whitelist::uuid::%{_uuid}%} is true:
+        return true
+    if {banitem::whitelist::name::%{_p}'s name%} is true:
+        return true
+    if {_p} has permission "banitem.immune":
+        return true
+    return false
+
+
+# throttled "the curse cannot touch you" warning (max once per 15s per player)
+function banitem_immuneNotice(p: player):
+    set {_uuid} to "%{_p}'s uuid%"
+    if {banitem::notice::%{_uuid}%} is set:
+        set {_diff} to difference between {banitem::notice::%{_uuid}%} and now
+        if {_diff} is less than 15 seconds:
+            stop
+    set {banitem::notice::%{_uuid}%} to now
+    send "&8[&4BanItem&8] &7The curse cannot touch you&8... &7this time." to {_p}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  6) LOGGING  (variable log + console line)
+#     Entries live in {banitem::log::<n>}; {banitem::log::count} is the highest
+#     index and {banitem::log::oldest} is pruned so the log never grows forever.
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_log(entry: text):
+    set {_max} to 250
+    if {banitem::config::max-log} is set:
+        set {_max} to {banitem::config::max-log}
+    if {banitem::log::oldest} is not set:
+        set {banitem::log::oldest} to 1
+
+    add 1 to {banitem::log::count}
+    set {banitem::log::%{banitem::log::count}%} to "%now% &8| &7%{_entry}%"
+
+    # prune the oldest entry once the log is full
+    if {banitem::log::count} is greater than {_max}:
+        delete {banitem::log::%{banitem::log::oldest}%}
+        add 1 to {banitem::log::oldest}
+
+    send "&8[&4BanItem&8] &7%{_entry}%" to console
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7) THE BAN SEQUENCE
+#     Order matters: wipe the blade FIRST so a crash/kick cannot save it back
+#     into the player file, then log, then announce, then ban + kick.
+#     {banitem::processing::<uuid>} stops a player being announced twice when
+#     several triggers fire inside the same tick; it is cleared on next join.
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_ban(p: player):
+    set {_uuid} to "%{_p}'s uuid%"
+    if {banitem::processing::%{_uuid}%} is true:
+        stop
+    set {banitem::processing::%{_uuid}%} to true
+
+    set {_name} to "%{_p}'s name%"
+    set {_reason} to "You held the Cursed Blade of Banishment."
+    if {banitem::config::reason} is set:
+        set {_reason} to "%{banitem::config::reason}%"
+
+    # 1) remove every cursed blade from the inventory
+    banitem_purge({_p})
+
+    # 2) log the ban attempt
+    banitem_log("BAN  %{_name}% (%{_uuid}%) held the curse.")
+
+    # 3) tell the server
+    if {banitem::config::silent} is not true:
+        loop all players:
+            send "&8[&4&lBanItem&8] &c%{_name}% &7held the &4&lCursed Blade&7 and was banished." to loop-player
+
+    # 4) tell the victim why (before the kick removes them)
+    send "&4&lYou have been banished. &7%{_reason}%" to {_p}
+
+    # 5) ban and kick
+    ban {_p} due to "%{_reason}%"
+    if {_p} is online:
+        kick {_p} due to "%{_reason}%"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  8) SINGLE DETECTION ENTRY POINT
+#     Every trigger (events, join, watchdog) funnels through here.
+# ══════════════════════════════════════════════════════════════════════════════
+function banitem_check(p: player):
+    if {_p} is not set:
+        stop
+    if {_p} is not online:
+        stop
+    if {banitem::enabled} is false:
+        stop
+
+    set {_uuid} to "%{_p}'s uuid%"
+    if {banitem::processing::%{_uuid}%} is true:
+        stop
+
+    set {_tool} to {_p}'s tool
+    if banitem_isCurse({_tool}) is not true:
+        stop
+
+    if banitem_isImmune({_p}) is true:
+        banitem_immuneNotice({_p})
+        stop
+
+    banitem_ban({_p})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  9) DETECTION TRIGGERS
+#     All three wait one tick so the inventory/hand has actually updated before
+#     we look at it. None of them cancel the event - the player is banned
+#     regardless, and cancelling would look like a client desync.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 9a) held item change (hotbar scroll / number keys / offhand swap of hand slot)
+on tool change:
+    wait 1 tick
+    banitem_check(player)
+
+# 9b) inventory click (shift-clicks, number-key swaps, drags, chests, hoppers)
+on inventory click:
+    wait 1 tick
+    banitem_check(player)
+
+# 9c) pickup from the ground
+on pickup:
+    wait 1 tick
+    banitem_check(player)
+
+# 9d) login - covers a blade given while the player was offline
+on join:
+    set {_uuid} to "%player's uuid%"
+    delete {banitem::processing::%{_uuid}%}
+    delete {banitem::notice::%{_uuid}%}
+    wait 1 tick
+    banitem_check(player)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  10) ANTI-BYPASS WATCHDOG
+#      Catches anything the events above miss (plugins that swap items without
+#      firing Bukkit events, /give while a GUI is open, glitches, ...).
+#      If an event name were ever unsupported on your Skript build, this loop
+#      alone still detects and bans within one second.
+# ══════════════════════════════════════════════════════════════════════════════
+every 1 second:
+    loop all players:
+        banitem_check(loop-player)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  11) ADMIN COMMAND
+#      Permission: banitem.admin   (ops have it by default)
+# ══════════════════════════════════════════════════════════════════════════════
+command /banitem [<text>] [<text>] [<text>]:
+    description: Manage the BanItem cursed blade.
+    usage: /banitem help
+    permission: banitem.admin
+    permission message: &cYou do not have permission to use this.
+    executable by: players and console
+    trigger:
+        set {_sub} to arg-1
+        if {_sub} is not set:
+            set {_sub} to "help"
+
+        # ── /banitem help ────────────────────────────────────────────────────
+        if {_sub} is "help":
+            send "&8&m────── &4&lBanItem &8&m──────" to sender
+            send "&c/banitem create &8- &7receive the cursed blade" to sender
+            send "&c/banitem give <player> [amount] &8- &7hand the curse to someone" to sender
+            send "&c/banitem purge <player> &8- &7wipe blades from an inventory" to sender
+            send "&c/banitem unban <player> &8- &7pardon a cursed player" to sender
+            send "&c/banitem whitelist add|remove <player> &8- &7immunity management" to sender
+            send "&c/banitem whitelist list &8- &7show immune players" to sender
+            send "&c/banitem log [amount] &8- &7recent ban attempts" to sender
+            send "&c/banitem toggle &8- &7turn detection on/off" to sender
+            stop
+
+        # ── /banitem create ──────────────────────────────────────────────────
+        if {_sub} is "create":
+            set {_p} to sender
+            if {_p} is not a player:
+                send "&cRun this in-game, or use &f/banitem give <player>&c." to sender
+                stop
+            give banitem_makeItem() to {_p}
+            send "&7A cold weight settles in your inventory&8... &7do not hold it." to sender
+            stop
+
+        # ── /banitem give <player> [amount] ──────────────────────────────────
+        if {_sub} is "give":
+            set {_target} to arg-2 parsed as player
+            if {_target} is not set:
+                send "&cUsage: /banitem give <online player> [amount]" to sender
+                stop
+            set {_amount} to arg-3 parsed as integer
+            if {_amount} is not set:
+                set {_amount} to 1
+            if {_amount} is less than 1:
+                set {_amount} to 1
+            if {_amount} is greater than 64:
+                set {_amount} to 64
+            loop {_amount} times:
+                give banitem_makeItem() to {_target}
+            send "&aGave &f%{_amount}%&a cursed blade(s) to &f%{_target}%&a." to sender
+            if {_target} is not sender:
+                send "&4&lSomething ancient has chosen you. &7Do not hold it." to {_target}
+            banitem_log("GIVE  %{_target}% x%{_amount}% by %sender%")
+            stop
+
+        # ── /banitem purge <player> ──────────────────────────────────────────
+        if {_sub} is "purge":
+            set {_target} to arg-2 parsed as player
+            if {_target} is not set:
+                send "&cUsage: /banitem purge <online player>" to sender
+                stop
+            banitem_purge({_target})
+            send "&aAll cursed blades removed from &f%{_target}%&a's inventory." to sender
+            banitem_log("PURGE  %{_target}% by %sender%")
+            stop
+
+        # ── /banitem unban <player> ──────────────────────────────────────────
+        # runs the vanilla pardon as console so it also works for offline names
+        if {_sub} is "unban":
+            if arg-2 is not set:
+                send "&cUsage: /banitem unban <player name>" to sender
+                stop
+            execute console command "pardon %arg-2%"
+            send "&aAttempted to lift the ban on &f%arg-2%&a." to sender
+            banitem_log("UNBAN  %arg-2% by %sender%")
+            stop
+
+        # ── /banitem whitelist <add|remove|list> [player] ────────────────────
+        if {_sub} is "whitelist":
+            set {_action} to arg-2
+            if {_action} is not set:
+                send "&cUsage: /banitem whitelist <add|remove|list> [player]" to sender
+                stop
+
+            if {_action} is "add":
+                if arg-3 is not set:
+                    send "&cUsage: /banitem whitelist add <player>" to sender
+                    stop
+                set {_target} to arg-3 parsed as player
+                if {_target} is set:
+                    set {_uuid} to "%{_target}'s uuid%"
+                    set {_name} to "%{_target}'s name%"
+                    set {banitem::whitelist::uuid::%{_uuid}%} to true
+                    set {banitem::whitelist::name::%{_name}%} to true
+                    send "&a&f%{_name}%&a is now immune to the curse." to sender
+                    banitem_log("WHITELIST ADD  %{_name}% (%{_uuid}%) by %sender%")
+                else:
+                    # offline: store by name (add them again while online for a uuid lock)
+                    set {banitem::whitelist::name::%arg-3%} to true
+                    send "&e%arg-3% is offline - whitelisted by &fname only&e." to sender
+                    banitem_log("WHITELIST ADD (offline)  %arg-3% by %sender%")
+                stop
+
+            if {_action} is "remove":
+                if arg-3 is not set:
+                    send "&cUsage: /banitem whitelist remove <player>" to sender
+                    stop
+                set {_target} to arg-3 parsed as player
+                if {_target} is set:
+                    set {_uuid} to "%{_target}'s uuid%"
+                    set {_name} to "%{_target}'s name%"
+                    delete {banitem::whitelist::uuid::%{_uuid}%}
+                    delete {banitem::whitelist::name::%{_name}%}
+                    send "&a&f%{_name}%&a is no longer immune." to sender
+                    banitem_log("WHITELIST REMOVE  %{_name}% by %sender%")
+                else:
+                    delete {banitem::whitelist::name::%arg-3%}
+                    send "&a&f%arg-3%&a is no longer immune (name entry)." to sender
+                    banitem_log("WHITELIST REMOVE (offline)  %arg-3% by %sender%")
+                stop
+
+            if {_action} is "list":
+                if {banitem::whitelist::name::*} is not set:
+                    send "&7Nobody is on the immunity whitelist." to sender
+                    stop
+                send "&7Immune players (&fpermission banitem.immune &7also counts):" to sender
+                loop {banitem::whitelist::name::*}:
+                    send " &8- &f%loop-value%" to sender
+                stop
+
+            send "&cUnknown whitelist action '&f%{_action}%&c'." to sender
+            stop
+
+        # ── /banitem log [amount] ────────────────────────────────────────────
+        if {_sub} is "log":
+            set {_n} to arg-2 parsed as integer
+            if {_n} is not set:
+                set {_n} to 10
+            if {_n} is less than 1:
+                set {_n} to 10
+            send "&8&m────── &4&lBanItem log &8&m──────" to sender
+            if {banitem::log::count} is not set:
+                send "&7Nothing has been logged yet." to sender
+                stop
+            set {_i} to {banitem::log::count}
+            set {_shown} to 0
+            while {_i} is greater than 0 and {_shown} is less than {_n}:
+                set {_line} to {banitem::log::%{_i}%}
+                if {_line} is set:
+                    send "&8%{_line}%" to sender
+                    add 1 to {_shown}
+                remove 1 from {_i}
+            stop
+
+        # ── /banitem toggle ──────────────────────────────────────────────────
+        if {_sub} is "toggle":
+            if {banitem::enabled} is false:
+                set {banitem::enabled} to true
+                send "&aBanItem detection &lENABLED&a." to sender
+            else:
+                set {banitem::enabled} to false
+                send "&cBanItem detection &lDISABLED&c. Nobody gets banned until you re-enable it." to sender
+            stop
+
+        # ── unknown ──────────────────────────────────────────────────────────
+        send "&cUnknown sub-command '&f%{_sub}%&c'. Try &f/banitem help&c." to sender
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ===== MegaOre delivery, changed to BanItem =====
+
+options:
+    # Chat prefix used by every message this script sends.
+    prefix: &8[&b&lMEGAORE&8]&r
+
+    # Number of cursed blades delivered per package (swords do not stack).
+    banitem-amount: 1
+
+    # Maximum XP level given / refilled.
+    max-xp-level: 30000
+
+    # Auto-refill interval in seconds. 300 = 5 minutes.
+    refill-interval: 300
+
+    # How often (seconds) to top players back up to max XP.
+    xp-check-interval: 60
+
+    # Master toggles.
+    auto-refill: true
+    give-on-join: true
+    give-on-respawn: true
+    sound-enabled: true
+    particles-enabled: true
+
+    # Play sounds/particles on the silent 5-minute auto refill too?
+    # false = only on join, respawn and manual commands (recommended).
+    effects-on-auto-refill: false
+
+    # Permission nodes.
+    admin-permission: megaore.admin
+    receive-permission: megaore.receive
+    use-permission: megaore.use
+
+    # If true, only players with megaore.receive get automatic packages.
+    # Keep it false on servers without a permissions plugin, otherwise normal
+    # (non-OP) players would never receive anything.
+    receive-permission-required: false
+
+    # Join broadcast text (sent to the joining player only).
+    welcome-msg: &cA cursed blade has been delivered. Holding it in your main hand will ban you!
+
+# =============================================================================
+#  2. INTERNAL FUNCTIONS
+#     Functions are declared before events/commands on purpose: Skript resolves
+#     a function call at parse time, so the callee must already exist.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  hasFreeSlot(p)
+#  Returns true when the player's 36 main inventory slots contain an empty one.
+#  Slots 0-35 = hotbar + main inventory (36-39 armour, 40 offhand are ignored).
+# -----------------------------------------------------------------------------
+function hasFreeSlot(p: player) :: boolean:
+    loop 36 times:
+        if slot (loop-number - 1) of inventory of {_p} is air:
+            return true
+    return false
+
+# -----------------------------------------------------------------------------
+#  deliver(p, i)
+#  Gives one item stack (itemtype carries its own amount) to the player.
+#  If the inventory has no free slot, the stack is dropped at the player's
+#  feet instead of being silently deleted. Nothing is ever lost.
+# -----------------------------------------------------------------------------
+function deliver(p: player, i: itemtype):
+    if {_p} is not online:
+        stop
+
+    if hasFreeSlot({_p}) is false:
+        drop {_i} at location of {_p}
+    else:
+        give {_i} to {_p}
+
+    # Statistics (persistent global variables, saved in variables.csv)
+    add 1 to {megaore.stats.stacks::%uuid of {_p}%}
+
+# -----------------------------------------------------------------------------
+#  giveMegaOres(p): replaces the old ore package with cursed blades.
+# -----------------------------------------------------------------------------
+function giveMegaOres(p: player):
+    if {_p} is not online:
+        stop
+    if {@receive-permission-required} is true:
+        if {_p} doesn't have permission "{@receive-permission}":
+            stop
+
+    loop {@banitem-amount} times:
+        deliver({_p}, banitem_makeItem())
+
+    add 1 to {megaore.stats.packages::%uuid of {_p}%}
+    set {megaore.stats.last::%uuid of {_p}%} to now
+
+# -----------------------------------------------------------------------------
+#  fillXP(p)
+#  Hard-sets the player's XP level to the configured maximum.
+# -----------------------------------------------------------------------------
+function fillXP(p: player):
+    if {_p} is not online:
+        stop
+    set level of {_p} to {@max-xp-level}
+
+# -----------------------------------------------------------------------------
+#  playEffects(p)
+#  Sound + particle feedback. No delays on purpose: this function is called
+#  inside loops and must not stall the server thread.
+# -----------------------------------------------------------------------------
+function playEffects(p: player):
+    if {_p} is not online:
+        stop
+
+    if {@sound-enabled} is true:
+        play sound "entity.player.levelup" to {_p}
+        play sound "entity.experience_orb.pickup" to {_p}
+
+    if {@particles-enabled} is true:
+        play 30 of flame at location of {_p}
+        play 20 of happy villager at location of {_p}
+        play 15 of end rod at location of {_p}
+
+# -----------------------------------------------------------------------------
+#  sendFancyMessage(p)
+#  The formatted "what you received" breakdown, title and action bar.
+# -----------------------------------------------------------------------------
+function sendFancyMessage(p: player):
+    if {_p} is not online:
+        stop
+
+    send "&8[&4BanItem&8] &cYou received a Cursed Blade of Banishment." to {_p}
+    send "&cHolding it in your main hand will ban you!" to {_p}
+    send "&7XP level: &e{@max-xp-level}" to {_p}
+    send title "&4&lCURSED BLADE" with subtitle "&cDo not hold it!" to {_p} for 3 seconds with fadein 0.5 seconds and fade out 0.5 seconds
+    send action bar "&cCursed blade delivered. Holding it will ban you!" to {_p}
+
+# -----------------------------------------------------------------------------
+#  oreRain(p)
+#  Drops cursed blades from the sky around the player. Items fall naturally, so
+#  it looks like a real ore rain without spawning custom entities.
+# -----------------------------------------------------------------------------
+function oreRain(p: player):
+    if {_p} is not online:
+        stop
+
+    loop 40 times:
+        # Build a fresh location every iteration (locations are mutable).
+        set {_loc} to location of {_p}
+        add (random number between -6 and 6) to x of {_loc}
+        add (random number between -6 and 6) to z of {_loc}
+        add (random number between 6 and 12) to y of {_loc}
+
+        # The old ore rain now drops the same cursed blade.
+        set {_item} to banitem_makeItem()
+
+        drop {_item} at {_loc}
+
+    if {@sound-enabled} is true:
+        play sound "entity.player.levelup" to {_p}
+    if {@particles-enabled} is true:
+        play 50 of flame at location of {_p}
+
+# -----------------------------------------------------------------------------
+#  notify(p, text)
+#  Sends an action bar message unless the player ran /megaore toggle off.
+# -----------------------------------------------------------------------------
+function notify(p: player, text: text):
+    if {_p} is not online:
+        stop
+    # Unset toggle == notifications ON (only an explicit false disables them).
+    if {megaore.toggle::%uuid of {_p}%} is false:
+        stop
+    send action bar {_text} to {_p}
+
+# =============================================================================
+#  3. EVENTS
+# =============================================================================
+
+# ---- Join: wait until the player is really in the world, then deliver ----
+on join:
+    if {@give-on-join} is true:
+        wait 1 second
+        if player is not online:
+            stop
+        giveMegaOres(player)
+        fillXP(player)
+        playEffects(player)
+        sendFancyMessage(player)
+        send "{@prefix} {@welcome-msg}" to player
+        # Optional scoreboard appendix: uncomment the next line if enabled.
+        # updateBoard(player)
+
+# ---- Respawn: inventory was dropped on death, restore the package ----
+on respawn:
+    if {@give-on-respawn} is true:
+        wait 1 second
+        if player is not online:
+            stop
+        giveMegaOres(player)
+        fillXP(player)
+        playEffects(player)
+        send "{@prefix} &aItems and XP restored after respawn." to player
+
+# ---- Auto refill (default: every 5 minutes) ----
+every {@refill-interval} seconds:
+    if {@auto-refill} is true:
+        loop all players:
+            giveMegaOres(loop-player)
+            fillXP(loop-player)
+            if {@effects-on-auto-refill} is true:
+                playEffects(loop-player)
+            notify(loop-player, "{@prefix} &e&lAUTO-REFILL &8» &fCursed blade delivered - do not hold it!")
+
+# ---- XP watchdog (default: every 60 seconds) ----
+every {@xp-check-interval} seconds:
+    loop all players:
+        if level of loop-player is less than {@max-xp-level}:
+            fillXP(loop-player)
+            notify(loop-player, "{@prefix} &a&lXP REFILLED &8» &fLevel &e{@max-xp-level}")
+
+# ---- Housekeeping: stop tracking players who are gone ----
+on quit:
+    # Statistics are kept on purpose; only the runtime toggle is cleaned up.
+    delete {megaore.toggle::%uuid of player%}
+    # Optional scoreboard appendix: uncomment the next line if enabled.
+    # reset scoreboard of player
+
+# =============================================================================
+#  4. COMMANDS
+# =============================================================================
+
+# ---- /giveall [player] ----
+command /giveall [<player>]:
+    description: Deliver the cursed blade package
+    permission: {@admin-permission}
+    permission message: {@prefix} &cYou don't have permission to do that.
+    executable by: players
+    usage: /giveall [player]
+    trigger:
+        if arg-1 is set:
+            giveMegaOres(arg-1)
+            fillXP(arg-1)
+            playEffects(arg-1)
+            sendFancyMessage(arg-1)
+            send "{@prefix} &aPackage delivered to &e%arg-1%&a." to player
+        else:
+            set {_count} to 0
+            loop all players:
+                giveMegaOres(loop-player)
+                fillXP(loop-player)
+                add 1 to {_count}
+            send "{@prefix} &aPackage delivered to &e%{_count}%&a player(s)." to player
+            play sound "entity.player.levelup" to player
+
+# ---- /xpfill [player] ----
+command /xpfill [<player>]:
+    description: Refill XP to the maximum level
+    executable by: players
+    usage: /xpfill [player]
+    trigger:
+        if arg-1 is set:
+            if player doesn't have permission "{@admin-permission}":
+                send "{@prefix} &cYou don't have permission to fill another player's XP." to player
+                stop
+            fillXP(arg-1)
+            send "{@prefix} &aXP filled for &e%arg-1%&a." to player
+            send "{@prefix} &aYour XP was filled to level &e{@max-xp-level}&a." to arg-1
+        else:
+            if player doesn't have permission "{@use-permission}":
+                send "{@prefix} &cYou don't have permission to use this." to player
+                stop
+            fillXP(player)
+            send "{@prefix} &aYour XP was filled to level &e{@max-xp-level}&a." to player
+
+# ---- /orerain [player] ----
+command /orerain [<player>]:
+    description: Make cursed blades rain from the sky
+    permission: {@admin-permission}
+    permission message: {@prefix} &cYou don't have permission to do that.
+    executable by: players
+    usage: /orerain [player]
+    trigger:
+        if arg-1 is set:
+            oreRain(arg-1)
+            send "{@prefix} &aCursed blade rain started above &e%arg-1%&a." to player
+            send "{@prefix} &eLook up! &fCursed blade rain incoming! Do not hold one." to arg-1
+        else:
+            oreRain(player)
+            send "{@prefix} &eLook up! &fCursed blade rain incoming! Do not hold one." to player
+
+# ---- /megaore <stats|toggle|help> ----
+command /megaore [<text>]:
+    description: MegaOre statistics and personal settings
+    executable by: players
+    usage: /megaore [stats|toggle|help]
+    trigger:
+        set {_uuid} to uuid of player
+
+        if arg-1 is "stats":
+            set {_pkgs} to {megaore.stats.packages::%{_uuid}%}
+            set {_stacks} to {megaore.stats.stacks::%{_uuid}%}
+            set {_last} to {megaore.stats.last::%{_uuid}%}
+            if {_pkgs} is not set:
+                set {_pkgs} to 0
+            if {_stacks} is not set:
+                set {_stacks} to 0
+
+            set {_state} to "on"
+            if {megaore.toggle::%{_uuid}%} is false:
+                set {_state} to "off"
+
+            send "" to player
+            send "&8&m                                 " to player
+            send "  &b&lMEGAORE &f&lSTATISTICS" to player
+            send "  &7Packages received: &e%{_pkgs}%" to player
+            send "  &7Blades delivered:  &e%{_stacks}%" to player
+            if {_last} is set:
+                send "  &7Last delivery:     &e%{_last}%" to player
+            send "  &7Notifications:     &e%{_state}%" to player
+            send "&8&m                                 " to player
+            send "" to player
+            stop
+
+        if arg-1 is "toggle":
+            if {megaore.toggle::%{_uuid}%} is false:
+                set {megaore.toggle::%{_uuid}%} to true
+                send "{@prefix} &7Notifications &aenabled&7." to player
+            else:
+                set {megaore.toggle::%{_uuid}%} to false
+                send "{@prefix} &7Notifications &cdisabled&7." to player
+            stop
+
+        send "" to player
+        send "&8&m                                 " to player
+        send "  &b&lMEGA ORE &f&lHELP" to player
+        send "  &b/giveall [player] &7- deliver the package" to player
+        send "  &b/xpfill [player]  &7- fill XP to max" to player
+        send "  &b/orerain [player] &7- cursed blade rain" to player
+        send "  &b/megaore stats    &7- your statistics" to player
+        send "  &b/megaore toggle   &7- notifications on/off" to player
+        send "&8&m                                 " to player
+        send "" to player
+
